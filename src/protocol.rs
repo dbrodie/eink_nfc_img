@@ -5,9 +5,44 @@
 //!
 //! Updated for flipperzero-rs v0.16.0 NFC API (callback-based poller model).
 
+extern crate alloc;
+
+use alloc::ffi::CString;
+use alloc::format;
 use core::cell::UnsafeCell;
+use core::ffi::CStr;
 use core::ptr::null_mut;
 use flipperzero_sys as sys;
+
+/// Log tag for debugging
+const TAG: &CStr = c"DMPL0154";
+
+/// Helper macro for debug logging
+macro_rules! log_info {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        if let Ok(c_msg) = CString::new(msg) {
+            sys::furi_log_print_format(
+                sys::FuriLogLevelInfo,
+                TAG.as_ptr(),
+                c_msg.as_ptr(),
+            );
+        }
+    }};
+}
+
+macro_rules! log_error {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        if let Ok(c_msg) = CString::new(msg) {
+            sys::furi_log_print_format(
+                sys::FuriLogLevelError,
+                TAG.as_ptr(),
+                c_msg.as_ptr(),
+            );
+        }
+    }};
+}
 
 /// Display dimensions
 pub const DISPLAY_WIDTH: usize = 200;
@@ -271,6 +306,7 @@ impl Dmpl0154Protocol {
             if ctx.state == PollerState::WaitingForTag {
                 if event_type == sys::Iso14443_4aPollerEventTypeReady {
                     // Tag detected! Transition to Init state
+                    log_info!("Tag detected! Starting protocol...");
                     ctx.state = PollerState::Init;
                     // Fall through to process Init state
                 } else {
@@ -296,9 +332,11 @@ impl Dmpl0154Protocol {
                     return sys::NfcCommandContinue;
                 }
                 PollerState::Init => {
+                    log_info!("State: Init - sending auth command");
                     if Self::send_command(poller, ctx, commands::INIT) {
                         ctx.state = PollerState::Gpio0;
                     } else {
+                        log_error!("Init command failed!");
                         ctx.state = PollerState::Error(NfcError::TransmitFailed);
                         return sys::NfcCommandStop;
                     }
@@ -485,21 +523,42 @@ impl Dmpl0154Protocol {
         cmd: &[u8],
     ) -> bool {
         unsafe {
+            // Log command (first 6 bytes max for brevity)
+            let cmd_preview: alloc::vec::Vec<u8> = cmd.iter().take(6).copied().collect();
+            log_info!("TX: {:02X?} (len={})", cmd_preview, cmd.len());
+
             sys::bit_buffer_reset(ctx.tx_buf);
             sys::bit_buffer_reset(ctx.rx_buf);
             sys::bit_buffer_copy_bytes(ctx.tx_buf, cmd.as_ptr(), cmd.len());
 
             let error = sys::iso14443_4a_poller_send_block(poller, ctx.tx_buf, ctx.rx_buf);
             if error != sys::Iso14443_4aErrorNone {
+                // Error codes: 0=None, 1=NotPresent, 2=Protocol, 3=Timeout
+                log_error!("NFC send error code: {}", error.0);
                 return false;
             }
 
-            // Check for success response (0x90 0x00)
+            // Log response
             let rx_size = sys::bit_buffer_get_size_bytes(ctx.rx_buf);
+            if rx_size > 0 {
+                let mut rx_bytes = alloc::vec::Vec::new();
+                for i in 0..core::cmp::min(rx_size, 8) {
+                    rx_bytes.push(sys::bit_buffer_get_byte(ctx.rx_buf, i));
+                }
+                log_info!("RX: {:02X?} (len={})", rx_bytes, rx_size);
+            } else {
+                log_info!("RX: empty");
+            }
+
+            // Check for success response (0x90 0x00)
             if rx_size >= 2 {
                 let sw1 = sys::bit_buffer_get_byte(ctx.rx_buf, 0);
                 let sw2 = sys::bit_buffer_get_byte(ctx.rx_buf, 1);
-                sw1 == 0x90 && sw2 == 0x00
+                let success = sw1 == 0x90 && sw2 == 0x00;
+                if !success {
+                    log_error!("Bad response: SW1={:02X} SW2={:02X}", sw1, sw2);
+                }
+                success
             } else {
                 true // Some commands may have minimal response
             }
