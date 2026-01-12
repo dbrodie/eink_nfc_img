@@ -1,0 +1,37 @@
+# Flipper Zero DMPL0154FN1 4-Color E-Ink NFC Writer
+
+cargo-features = ["different-binary-name"]
+
+[package]
+name = "dmpl0154fn1"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+publish = false
+
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[[bin]]
+name = "dmpl0154fn1"
+filename = "dmpl0154fn1.fap"
+bench = false
+test = false
+
+[dependencies]
+# Formatting for no_std
+ufmt = "0.2"
+
+# Flipper Zero SDK crates (v0.16.0)
+flipperzero = { version = "0.16.0", features = ["alloc"] }
+flipperzero-sys = { version = "0.16.0" }
+flipperzero-rt = { version = "0.16.0" }
+flipperzero-alloc = { version = "0.16.0" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

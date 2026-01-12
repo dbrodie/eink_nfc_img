@@ -1,0 +1,560 @@
+//! NFC IsoDep protocol implementation for DMPL0154FN1 4-color e-ink display
+//!
+//! Protocol reverse-engineered from the official Android app.
+//! See PROTOCOL.md for detailed command documentation.
+//!
+//! Updated for flipperzero-rs v0.16.0 NFC API (callback-based poller model).
+
+use core::cell::UnsafeCell;
+use core::ptr::null_mut;
+use flipperzero_sys as sys;
+
+/// Display dimensions
+pub const DISPLAY_WIDTH: usize = 200;
+pub const DISPLAY_HEIGHT: usize = 200;
+
+/// Bytes per row (200 pixels * 2 bits / 8 bits per byte)
+pub const BYTES_PER_ROW: usize = 50;
+
+/// Total image data size (200 * 200 * 2 bits / 8 = 10,000 bytes)
+pub const IMAGE_DATA_SIZE: usize = 10_000;
+
+/// Chunk size for data transfer
+pub const CHUNK_SIZE: usize = 250;
+
+/// Number of data packets (10000 / 250 = 40)
+pub const NUM_PACKETS: usize = IMAGE_DATA_SIZE / CHUNK_SIZE;
+
+/// NFC communication timeout in milliseconds
+pub const NFC_TIMEOUT_MS: u32 = 2000;
+
+/// Command class byte (0x74 = 116)
+pub const CMD_CLASS: u8 = 0x74;
+
+/// Success status word
+pub const SW_SUCCESS: [u8; 2] = [0x90, 0x00];
+
+/// NFC operation errors
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NfcError {
+    /// NFC hardware is busy
+    Busy,
+    /// No tag detected
+    NoTag,
+    /// Tag detection failed
+    DetectFailed,
+    /// Command transmission failed
+    TransmitFailed,
+    /// Invalid response from tag
+    BadResponse,
+    /// Operation timed out
+    Timeout,
+    /// Allocation failed
+    AllocFailed,
+}
+
+pub type NfcResult<T> = Result<T, NfcError>;
+
+/// Pre-defined command sequences for DMPL0154FN1
+pub mod commands {
+    /// Authentication/Init: 74 B1 00 00 08 00 11 22 33 44 55 66 77
+    pub const INIT: &[u8] = &[
+        0x74, 0xB1, 0x00, 0x00, 0x08,
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    ];
+
+    /// GPIO/Power control step 0: 74 97 00 08 00
+    pub const GPIO_0: &[u8] = &[0x74, 0x97, 0x00, 0x08, 0x00];
+
+    /// GPIO/Power control step 1: 74 97 01 08 00
+    pub const GPIO_1: &[u8] = &[0x74, 0x97, 0x01, 0x08, 0x00];
+
+    /// Display initialization: 74 00 15 00 00
+    pub const DISPLAY_INIT: &[u8] = &[0x74, 0x00, 0x15, 0x00, 0x00];
+
+    /// Start data transmission: 74 01 15 01 00
+    pub const START_TX: &[u8] = &[0x74, 0x01, 0x15, 0x01, 0x00];
+
+    /// Trigger display refresh: 74 02 15 02 00
+    pub const REFRESH: &[u8] = &[0x74, 0x02, 0x15, 0x02, 0x00];
+
+    /// Read busy status: 74 9B 00 0F 01
+    pub const READ_STATUS: &[u8] = &[0x74, 0x9B, 0x00, 0x0F, 0x01];
+
+    /// Register configurations for 4-color mode
+    /// Register 0xE0 = 0x02
+    pub const REG_E0: u8 = 0xE0;
+    pub const REG_E0_VAL: &[u8] = &[0x02];
+
+    /// Register 0xE6 = 0x5D
+    pub const REG_E6: u8 = 0xE6;
+    pub const REG_E6_VAL: &[u8] = &[0x5D];
+
+    /// Register 0xA5 = 0x00
+    pub const REG_A5: u8 = 0xA5;
+    pub const REG_A5_VAL: &[u8] = &[0x00];
+
+    /// Cleanup register 0x02 = 0x00
+    pub const REG_02: u8 = 0x02;
+    pub const REG_02_VAL: &[u8] = &[0x00];
+
+    /// Cleanup register 0x07 = 0xA5
+    pub const REG_07: u8 = 0x07;
+    pub const REG_07_VAL: &[u8] = &[0xA5];
+}
+
+/// State machine states for the poller callback
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PollerState {
+    Init,
+    Gpio0,
+    Gpio1,
+    DisplayInit,
+    RegE0Select,
+    RegE0Write,
+    RegE6Select,
+    RegE6Write,
+    RegA5Select,
+    RegA5Write,
+    StartTx,
+    SendData(usize), // packet index
+    Refresh,
+    WaitRefresh,
+    PollStatus,
+    Cleanup02Select,
+    Cleanup02Write,
+    Cleanup07Select,
+    Cleanup07Write,
+    Done,
+    Error(NfcError),
+}
+
+/// Context passed to the NFC poller callback
+struct PollerContext {
+    state: PollerState,
+    image_data: *const u8,
+    tx_buf: *mut sys::BitBuffer,
+    rx_buf: *mut sys::BitBuffer,
+}
+
+/// Protocol handler for DMPL0154FN1 NFC e-ink display
+pub struct Dmpl0154Protocol {
+    nfc: *mut sys::Nfc,
+    poller: *mut sys::NfcPoller,
+    context: UnsafeCell<PollerContext>,
+    result: NfcResult<()>,
+}
+
+impl Dmpl0154Protocol {
+    /// Create a new protocol handler
+    pub fn new() -> Self {
+        Self {
+            nfc: null_mut(),
+            poller: null_mut(),
+            context: UnsafeCell::new(PollerContext {
+                state: PollerState::Init,
+                image_data: null_mut(),
+                tx_buf: null_mut(),
+                rx_buf: null_mut(),
+            }),
+            result: Ok(()),
+        }
+    }
+
+    /// Initialize NFC hardware
+    fn init_nfc(&mut self) -> NfcResult<()> {
+        unsafe {
+            // Allocate NFC instance
+            self.nfc = sys::nfc_alloc();
+            if self.nfc.is_null() {
+                return Err(NfcError::AllocFailed);
+            }
+
+            // Allocate poller for ISO14443-4A protocol
+            self.poller = sys::nfc_poller_alloc(self.nfc, sys::NfcProtocolIso14443_4a);
+            if self.poller.is_null() {
+                sys::nfc_free(self.nfc);
+                self.nfc = null_mut();
+                return Err(NfcError::AllocFailed);
+            }
+
+            // Initialize context buffers
+            let ctx = &mut *self.context.get();
+            ctx.tx_buf = sys::bit_buffer_alloc(512);
+            ctx.rx_buf = sys::bit_buffer_alloc(512);
+
+            if ctx.tx_buf.is_null() || ctx.rx_buf.is_null() {
+                self.cleanup();
+                return Err(NfcError::AllocFailed);
+            }
+
+            Ok(())
+        }
+    }
+
+    /// Clean up NFC resources
+    pub fn cleanup(&mut self) {
+        unsafe {
+            let ctx = &mut *self.context.get();
+
+            if !ctx.tx_buf.is_null() {
+                sys::bit_buffer_free(ctx.tx_buf);
+                ctx.tx_buf = null_mut();
+            }
+            if !ctx.rx_buf.is_null() {
+                sys::bit_buffer_free(ctx.rx_buf);
+                ctx.rx_buf = null_mut();
+            }
+
+            if !self.poller.is_null() {
+                sys::nfc_poller_free(self.poller);
+                self.poller = null_mut();
+            }
+            if !self.nfc.is_null() {
+                sys::nfc_free(self.nfc);
+                self.nfc = null_mut();
+            }
+        }
+    }
+
+    /// Write image data to the display
+    ///
+    /// This executes the full protocol sequence using the NFC poller API:
+    /// 1. Initialize communication
+    /// 2. Configure display registers
+    /// 3. Transfer image data in 250-byte chunks
+    /// 4. Trigger display refresh
+    /// 5. Wait for refresh to complete
+    /// 6. Cleanup
+    pub fn write_image(&mut self, image_data: &[u8; IMAGE_DATA_SIZE]) -> NfcResult<()> {
+        // Initialize NFC
+        self.init_nfc()?;
+
+        unsafe {
+            // Set up context
+            let ctx = &mut *self.context.get();
+            ctx.state = PollerState::Init;
+            ctx.image_data = image_data.as_ptr();
+
+            // Start poller with callback
+            sys::nfc_poller_start(
+                self.poller,
+                Some(Self::poller_callback),
+                self.context.get() as *mut core::ffi::c_void,
+            );
+
+            // Wait for completion by polling the state
+            // The callback will run on the NFC thread and update the state
+            loop {
+                sys::furi_delay_ms(100);
+                let state = (*self.context.get()).state;
+                match state {
+                    PollerState::Done => {
+                        self.result = Ok(());
+                        break;
+                    }
+                    PollerState::Error(e) => {
+                        self.result = Err(e);
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+
+            // Stop poller
+            sys::nfc_poller_stop(self.poller);
+        }
+
+        // Clean up and return result
+        self.cleanup();
+        self.result
+    }
+
+    /// NFC poller callback - implements the protocol state machine
+    unsafe extern "C" fn poller_callback(
+        event: sys::NfcGenericEvent,
+        context: *mut core::ffi::c_void,
+    ) -> sys::NfcCommand {
+        let ctx = &mut *(context as *mut PollerContext);
+
+        // Only process on Ready events
+        let event_data = event.event_data as *const sys::Iso14443_4aPollerEvent;
+        if event_data.is_null() {
+            return sys::NfcCommandContinue;
+        }
+
+        let event_type = (*event_data).type_;
+        if event_type != sys::Iso14443_4aPollerEventTypeReady {
+            // If error event, stop
+            if event_type == sys::Iso14443_4aPollerEventTypeError {
+                ctx.state = PollerState::Error(NfcError::DetectFailed);
+                return sys::NfcCommandStop;
+            }
+            return sys::NfcCommandContinue;
+        }
+
+        // Get the ISO14443-4A poller instance
+        let poller = event.instance as *mut sys::Iso14443_4aPoller;
+
+        // Process state machine
+        match ctx.state {
+            PollerState::Init => {
+                if Self::send_command(poller, ctx, commands::INIT) {
+                    ctx.state = PollerState::Gpio0;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::Gpio0 => {
+                if Self::send_command(poller, ctx, commands::GPIO_0) {
+                    sys::furi_delay_ms(50);
+                    ctx.state = PollerState::Gpio1;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::Gpio1 => {
+                if Self::send_command(poller, ctx, commands::GPIO_1) {
+                    sys::furi_delay_ms(200);
+                    ctx.state = PollerState::DisplayInit;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::DisplayInit => {
+                if Self::send_command(poller, ctx, commands::DISPLAY_INIT) {
+                    sys::furi_delay_ms(100);
+                    ctx.state = PollerState::RegE0Select;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::RegE0Select => {
+                if Self::send_select_register(poller, ctx, commands::REG_E0) {
+                    ctx.state = PollerState::RegE0Write;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::RegE0Write => {
+                if Self::send_write_data(poller, ctx, commands::REG_E0_VAL) {
+                    ctx.state = PollerState::RegE6Select;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::RegE6Select => {
+                if Self::send_select_register(poller, ctx, commands::REG_E6) {
+                    ctx.state = PollerState::RegE6Write;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::RegE6Write => {
+                if Self::send_write_data(poller, ctx, commands::REG_E6_VAL) {
+                    ctx.state = PollerState::RegA5Select;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::RegA5Select => {
+                if Self::send_select_register(poller, ctx, commands::REG_A5) {
+                    ctx.state = PollerState::RegA5Write;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::RegA5Write => {
+                if Self::send_write_data(poller, ctx, commands::REG_A5_VAL) {
+                    sys::furi_delay_ms(100);
+                    ctx.state = PollerState::StartTx;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::StartTx => {
+                if Self::send_command(poller, ctx, commands::START_TX) {
+                    ctx.state = PollerState::SendData(0);
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::SendData(packet_idx) => {
+                if Self::send_image_packet(poller, ctx, packet_idx) {
+                    if packet_idx + 1 >= NUM_PACKETS {
+                        sys::furi_delay_ms(50);
+                        ctx.state = PollerState::Refresh;
+                    } else {
+                        ctx.state = PollerState::SendData(packet_idx + 1);
+                    }
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::Refresh => {
+                if Self::send_command(poller, ctx, commands::REFRESH) {
+                    ctx.state = PollerState::WaitRefresh;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::WaitRefresh => {
+                // Wait for initial refresh (10 seconds)
+                sys::furi_delay_ms(10000);
+                ctx.state = PollerState::PollStatus;
+            }
+            PollerState::PollStatus => {
+                // Poll busy status
+                if Self::send_command(poller, ctx, commands::READ_STATUS) {
+                    // Check if display is ready (non-zero response)
+                    let rx_size = sys::bit_buffer_get_size_bytes(ctx.rx_buf);
+                    if rx_size > 0 {
+                        let first_byte = sys::bit_buffer_get_byte(ctx.rx_buf, 0);
+                        if first_byte != 0x00 {
+                            ctx.state = PollerState::Cleanup02Select;
+                        } else {
+                            // Still busy, wait and poll again
+                            sys::furi_delay_ms(400);
+                            // Stay in PollStatus state
+                        }
+                    } else {
+                        ctx.state = PollerState::Cleanup02Select;
+                    }
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::Cleanup02Select => {
+                if Self::send_select_register(poller, ctx, commands::REG_02) {
+                    ctx.state = PollerState::Cleanup02Write;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::Cleanup02Write => {
+                if Self::send_write_data(poller, ctx, commands::REG_02_VAL) {
+                    sys::furi_delay_ms(200);
+                    ctx.state = PollerState::Cleanup07Select;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::Cleanup07Select => {
+                if Self::send_select_register(poller, ctx, commands::REG_07) {
+                    ctx.state = PollerState::Cleanup07Write;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::Cleanup07Write => {
+                if Self::send_write_data(poller, ctx, commands::REG_07_VAL) {
+                    ctx.state = PollerState::Done;
+                    return sys::NfcCommandStop;
+                } else {
+                    ctx.state = PollerState::Error(NfcError::TransmitFailed);
+                    return sys::NfcCommandStop;
+                }
+            }
+            PollerState::Done | PollerState::Error(_) => {
+                return sys::NfcCommandStop;
+            }
+        }
+
+        sys::NfcCommandContinue
+    }
+
+    /// Helper: Send a raw command and check for success
+    unsafe fn send_command(
+        poller: *mut sys::Iso14443_4aPoller,
+        ctx: &mut PollerContext,
+        cmd: &[u8],
+    ) -> bool {
+        sys::bit_buffer_reset(ctx.tx_buf);
+        sys::bit_buffer_reset(ctx.rx_buf);
+        sys::bit_buffer_copy_bytes(ctx.tx_buf, cmd.as_ptr(), cmd.len());
+
+        let error = sys::iso14443_4a_poller_send_block(poller, ctx.tx_buf, ctx.rx_buf);
+        if error != sys::Iso14443_4aErrorNone {
+            return false;
+        }
+
+        // Check for success response (0x90 0x00)
+        let rx_size = sys::bit_buffer_get_size_bytes(ctx.rx_buf);
+        if rx_size >= 2 {
+            let sw1 = sys::bit_buffer_get_byte(ctx.rx_buf, 0);
+            let sw2 = sys::bit_buffer_get_byte(ctx.rx_buf, 1);
+            sw1 == 0x90 && sw2 == 0x00
+        } else {
+            true // Some commands may have minimal response
+        }
+    }
+
+    /// Helper: Send a select register command
+    unsafe fn send_select_register(
+        poller: *mut sys::Iso14443_4aPoller,
+        ctx: &mut PollerContext,
+        reg: u8,
+    ) -> bool {
+        let cmd = [0x74, 0x99, 0x00, 0x0D, 0x01, reg];
+        Self::send_command(poller, ctx, &cmd)
+    }
+
+    /// Helper: Send a write data command
+    unsafe fn send_write_data(
+        poller: *mut sys::Iso14443_4aPoller,
+        ctx: &mut PollerContext,
+        data: &[u8],
+    ) -> bool {
+        let mut cmd = [0u8; 260];
+        cmd[0] = 0x74;
+        cmd[1] = 0x9A;
+        cmd[2] = 0x00;
+        cmd[3] = 0x0E;
+        cmd[4] = data.len() as u8;
+        cmd[5..5 + data.len()].copy_from_slice(data);
+        Self::send_command(poller, ctx, &cmd[..5 + data.len()])
+    }
+
+    /// Helper: Send an image data packet
+    unsafe fn send_image_packet(
+        poller: *mut sys::Iso14443_4aPoller,
+        ctx: &mut PollerContext,
+        packet_idx: usize,
+    ) -> bool {
+        let mut packet = [0u8; 255];
+        packet[0] = 0x74;
+        packet[1] = 0x9A;
+        packet[2] = 0x00;
+        packet[3] = 0x0E;
+        packet[4] = 0xFA; // 250 bytes
+
+        let offset = packet_idx * CHUNK_SIZE;
+        let src = ctx.image_data.add(offset);
+        core::ptr::copy_nonoverlapping(src, packet[5..].as_mut_ptr(), CHUNK_SIZE);
+
+        Self::send_command(poller, ctx, &packet)
+    }
+}
+
+impl Drop for Dmpl0154Protocol {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
