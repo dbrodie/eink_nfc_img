@@ -86,6 +86,7 @@ pub mod commands {
 /// State machine states for the poller callback
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PollerState {
+    WaitingForTag,
     Init,
     Gpio0,
     Gpio1,
@@ -132,7 +133,7 @@ impl Dmpl0154Protocol {
             nfc: null_mut(),
             poller: null_mut(),
             context: UnsafeCell::new(PollerContext {
-                state: PollerState::Init,
+                state: PollerState::WaitingForTag,
                 image_data: null_mut(),
                 tx_buf: null_mut(),
                 rx_buf: null_mut(),
@@ -213,7 +214,7 @@ impl Dmpl0154Protocol {
         unsafe {
             // Set up context
             let ctx = &mut *self.context.get();
-            ctx.state = PollerState::Init;
+            ctx.state = PollerState::WaitingForTag;
             ctx.image_data = image_data.as_ptr();
 
             // Start poller with callback
@@ -258,15 +259,26 @@ impl Dmpl0154Protocol {
         unsafe {
             let ctx = &mut *(context as *mut PollerContext);
 
-            // Only process on Ready events
+            // Check event data
             let event_data = event.event_data as *const sys::Iso14443_4aPollerEvent;
             if event_data.is_null() {
                 return sys::NfcCommandContinue;
             }
 
             let event_type = (*event_data).type_;
-            if event_type != sys::Iso14443_4aPollerEventTypeReady {
-                // If error event, stop
+
+            // Handle WaitingForTag state specially - keep polling on errors
+            if ctx.state == PollerState::WaitingForTag {
+                if event_type == sys::Iso14443_4aPollerEventTypeReady {
+                    // Tag detected! Transition to Init state
+                    ctx.state = PollerState::Init;
+                    // Fall through to process Init state
+                } else {
+                    // Not ready yet (error or other event), keep polling
+                    return sys::NfcCommandContinue;
+                }
+            } else if event_type != sys::Iso14443_4aPollerEventTypeReady {
+                // For non-waiting states, errors are fatal
                 if event_type == sys::Iso14443_4aPollerEventTypeError {
                     ctx.state = PollerState::Error(NfcError::DetectFailed);
                     return sys::NfcCommandStop;
@@ -279,6 +291,10 @@ impl Dmpl0154Protocol {
 
             // Process state machine
             match ctx.state {
+                PollerState::WaitingForTag => {
+                    // Should not reach here, but just in case
+                    return sys::NfcCommandContinue;
+                }
                 PollerState::Init => {
                     if Self::send_command(poller, ctx, commands::INIT) {
                         ctx.state = PollerState::Gpio0;
