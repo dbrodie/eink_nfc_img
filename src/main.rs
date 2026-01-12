@@ -30,6 +30,7 @@ entry!(main);
 struct App {
     view_dispatcher: *mut sys::ViewDispatcher,
     submenu: *mut sys::Submenu,
+    write_submenu: *mut sys::Submenu,
     widget: *mut sys::Widget,
     gui: *mut sys::Gui,
     image_data: Option<Box<[u8; protocol::IMAGE_DATA_SIZE]>>,
@@ -38,12 +39,16 @@ struct App {
 
 /// View IDs
 const VIEW_MENU: u32 = 0;
-const VIEW_WIDGET: u32 = 1;
+const VIEW_WRITE_MENU: u32 = 1;
+const VIEW_WIDGET: u32 = 2;
 
-/// Menu item IDs
+/// Main menu item IDs
 const MENU_SELECT_IMAGE: u32 = 0;
-const MENU_WRITE_TAG: u32 = 1;
-const MENU_ABOUT: u32 = 2;
+const MENU_ABOUT: u32 = 1;
+
+/// Write menu item IDs
+const WRITE_MENU_WRITE: u32 = 0;
+const WRITE_MENU_CANCEL: u32 = 1;
 
 /// Helper macro for C string literals (returns *const c_char)
 macro_rules! c_str {
@@ -57,6 +62,7 @@ impl App {
         Self {
             view_dispatcher: null_mut(),
             submenu: null_mut(),
+            write_submenu: null_mut(),
             widget: null_mut(),
             gui: null_mut(),
             image_data: None,
@@ -72,9 +78,15 @@ impl App {
                 return false;
             }
 
-            // Allocate submenu
+            // Allocate main submenu
             self.submenu = sys::submenu_alloc();
             if self.submenu.is_null() {
+                return false;
+            }
+
+            // Allocate write submenu
+            self.write_submenu = sys::submenu_alloc();
+            if self.write_submenu.is_null() {
                 return false;
             }
 
@@ -84,18 +96,11 @@ impl App {
                 return false;
             }
 
-            // Add menu items
+            // Add main menu items
             sys::submenu_add_item(
                 self.submenu,
                 c_str!("Select Image"),
                 MENU_SELECT_IMAGE,
-                Some(menu_callback),
-                self as *mut _ as *mut c_void,
-            );
-            sys::submenu_add_item(
-                self.submenu,
-                c_str!("Write to Tag"),
-                MENU_WRITE_TAG,
                 Some(menu_callback),
                 self as *mut _ as *mut c_void,
             );
@@ -107,11 +112,32 @@ impl App {
                 self as *mut _ as *mut c_void,
             );
 
+            // Add write menu items
+            sys::submenu_add_item(
+                self.write_submenu,
+                c_str!("Write to Tag"),
+                WRITE_MENU_WRITE,
+                Some(write_menu_callback),
+                self as *mut _ as *mut c_void,
+            );
+            sys::submenu_add_item(
+                self.write_submenu,
+                c_str!("Cancel"),
+                WRITE_MENU_CANCEL,
+                Some(write_menu_callback),
+                self as *mut _ as *mut c_void,
+            );
+
             // Add views to dispatcher
             sys::view_dispatcher_add_view(
                 self.view_dispatcher,
                 VIEW_MENU,
                 sys::submenu_get_view(self.submenu),
+            );
+            sys::view_dispatcher_add_view(
+                self.view_dispatcher,
+                VIEW_WRITE_MENU,
+                sys::submenu_get_view(self.write_submenu),
             );
             sys::view_dispatcher_add_view(
                 self.view_dispatcher,
@@ -160,11 +186,15 @@ impl App {
         unsafe {
             // Remove views
             sys::view_dispatcher_remove_view(self.view_dispatcher, VIEW_MENU);
+            sys::view_dispatcher_remove_view(self.view_dispatcher, VIEW_WRITE_MENU);
             sys::view_dispatcher_remove_view(self.view_dispatcher, VIEW_WIDGET);
 
             // Free resources
             if !self.submenu.is_null() {
                 sys::submenu_free(self.submenu);
+            }
+            if !self.write_submenu.is_null() {
+                sys::submenu_free(self.write_submenu);
             }
             if !self.widget.is_null() {
                 sys::widget_free(self.widget);
@@ -204,20 +234,46 @@ impl App {
         }
     }
 
+    unsafe fn show_write_menu(&mut self) {
+        unsafe {
+            self.current_view = VIEW_WRITE_MENU;
+            sys::view_dispatcher_switch_to_view(self.view_dispatcher, VIEW_WRITE_MENU);
+        }
+    }
+
+    unsafe fn show_main_menu(&mut self) {
+        unsafe {
+            self.current_view = VIEW_MENU;
+            sys::view_dispatcher_switch_to_view(self.view_dispatcher, VIEW_MENU);
+        }
+    }
+
     unsafe fn on_menu_select(&mut self, index: u32) {
         unsafe {
             match index {
                 MENU_SELECT_IMAGE => {
                     self.select_image();
                 }
-                MENU_WRITE_TAG => {
-                    self.write_to_tag();
-                }
                 MENU_ABOUT => {
                     self.show_message(
                         c_str!("DMPL0154FN1 Writer"),
                         c_str!("4-color e-ink NFC tag"),
                     );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    unsafe fn on_write_menu_select(&mut self, index: u32) {
+        unsafe {
+            match index {
+                WRITE_MENU_WRITE => {
+                    self.write_to_tag();
+                }
+                WRITE_MENU_CANCEL => {
+                    self.image_data = None;
+                    self.show_main_menu();
                 }
                 _ => {}
             }
@@ -252,7 +308,11 @@ impl App {
                 match image::load_4ei_file(path_ptr) {
                     Ok(data) => {
                         self.image_data = Some(data);
-                        self.show_message(c_str!("Image Loaded"), c_str!("Ready to write"));
+                        // Cleanup and show write menu
+                        sys::furi_string_free(path);
+                        sys::furi_record_close(c_str!("dialogs"));
+                        self.show_write_menu();
+                        return;
                     }
                     Err(_) => {
                         self.show_message(c_str!("Error"), c_str!("Failed to load image"));
@@ -301,11 +361,19 @@ impl App {
     }
 }
 
-/// Menu item callback
+/// Main menu item callback
 unsafe extern "C" fn menu_callback(context: *mut c_void, index: u32) {
     unsafe {
         let app = &mut *(context as *mut App);
         app.on_menu_select(index);
+    }
+}
+
+/// Write menu item callback
+unsafe extern "C" fn write_menu_callback(context: *mut c_void, index: u32) {
+    unsafe {
+        let app = &mut *(context as *mut App);
+        app.on_write_menu_select(index);
     }
 }
 
@@ -314,13 +382,20 @@ unsafe extern "C" fn navigation_callback(context: *mut c_void) -> bool {
     unsafe {
         let app = &mut *(context as *mut App);
 
-        if app.current_view == VIEW_MENU {
-            // On main menu, exit the app
-            sys::view_dispatcher_stop(app.view_dispatcher);
-        } else {
-            // Go back to menu
-            app.current_view = VIEW_MENU;
-            sys::view_dispatcher_switch_to_view(app.view_dispatcher, VIEW_MENU);
+        match app.current_view {
+            VIEW_MENU => {
+                // On main menu, exit the app
+                sys::view_dispatcher_stop(app.view_dispatcher);
+            }
+            VIEW_WRITE_MENU => {
+                // On write menu, go back to main menu and clear image
+                app.image_data = None;
+                app.show_main_menu();
+            }
+            _ => {
+                // On other views (widget), go back to main menu
+                app.show_main_menu();
+            }
         }
 
         // Return true to indicate event was handled
