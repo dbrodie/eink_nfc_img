@@ -33,6 +33,7 @@ struct App {
     widget: *mut sys::Widget,
     gui: *mut sys::Gui,
     image_data: Option<Box<[u8; protocol::IMAGE_DATA_SIZE]>>,
+    current_view: u32,
 }
 
 /// View IDs
@@ -59,6 +60,7 @@ impl App {
             widget: null_mut(),
             gui: null_mut(),
             image_data: None,
+            current_view: VIEW_MENU,
         }
     }
 
@@ -197,6 +199,7 @@ impl App {
                 sys::FontSecondary,
                 message,
             );
+            self.current_view = VIEW_WIDGET;
             sys::view_dispatcher_switch_to_view(self.view_dispatcher, VIEW_WIDGET);
         }
     }
@@ -311,8 +314,14 @@ unsafe extern "C" fn navigation_callback(context: *mut c_void) -> bool {
     unsafe {
         let app = &mut *(context as *mut App);
 
-        // Go back to menu
-        sys::view_dispatcher_switch_to_view(app.view_dispatcher, VIEW_MENU);
+        if app.current_view == VIEW_MENU {
+            // On main menu, exit the app
+            sys::view_dispatcher_stop(app.view_dispatcher);
+        } else {
+            // Go back to menu
+            app.current_view = VIEW_MENU;
+            sys::view_dispatcher_switch_to_view(app.view_dispatcher, VIEW_MENU);
+        }
 
         // Return true to indicate event was handled
         true
