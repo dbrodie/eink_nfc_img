@@ -33,7 +33,7 @@ The NFC protocols were reverse-engineered from the official Android app (`DMPL01
 cargo build --release
 ```
 
-Output: `target/thumbv7em-none-eabihf/release/dmpl0154fn1.fap`
+Output: `target/thumbv7em-none-eabihf/release/eink_nfc_img.fap`
 
 ## Toolchain
 

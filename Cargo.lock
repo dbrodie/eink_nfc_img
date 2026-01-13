@@ -50,7 +50,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dmpl0154fn1"
+name = "eink_nfc_img"
 version = "0.1.0"
 dependencies = [
  "flipperzero",

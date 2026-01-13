@@ -3,7 +3,7 @@
 cargo-features = ["different-binary-name"]
 
 [package]
-name = "dmpl0154fn1"
+name = "eink_nfc_img"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85.0"
@@ -15,8 +15,8 @@ autotests = false
 autobenches = false
 
 [[bin]]
-name = "dmpl0154fn1"
-filename = "dmpl0154fn1.fap"
+name = "eink_nfc_img"
+filename = "eink_nfc_img.fap"
 bench = false
 test = false
 

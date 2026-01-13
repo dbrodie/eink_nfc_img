@@ -48,13 +48,13 @@ A Flipper Zero application for writing images to GoodDisplay/Waveshare NFC-power
 cargo +nightly-2025-08-31 build --release
 ```
 
-The output `.fap` file will be at `target/thumbv7em-none-eabihf/release/dmpl0154fn1.fap`.
+The output `.fap` file will be at `target/thumbv7em-none-eabihf/release/eink_nfc_img.fap`.
 
 ### Install on Flipper Zero
 
 1. Copy the `.fap` file to your Flipper Zero SD card:
    ```
-   /ext/apps/NFC/dmpl0154fn1.fap
+   /ext/apps/NFC/eink_nfc_img.fap
    ```
 
 2. On Flipper: Navigate to **Apps → NFC → E-Ink NFC**
