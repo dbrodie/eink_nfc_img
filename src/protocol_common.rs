@@ -5,8 +5,6 @@
 
 extern crate alloc;
 
-use alloc::ffi::CString;
-use alloc::format;
 use alloc::vec::Vec;
 use core::ffi::CStr;
 use flipperzero_sys as sys;
@@ -17,11 +15,11 @@ pub const TAG: &CStr = c"EINK_NFC";
 /// Helper macro for debug logging
 macro_rules! log_info {
     ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        if let Ok(c_msg) = CString::new(msg) {
+        let msg = alloc::format!($($arg)*);
+        if let Ok(c_msg) = alloc::ffi::CString::new(msg) {
             unsafe {
-                sys::furi_log_print_format(
-                    sys::FuriLogLevelInfo,
+                flipperzero_sys::furi_log_print_format(
+                    flipperzero_sys::FuriLogLevelInfo,
                     $crate::protocol_common::TAG.as_ptr(),
                     c_msg.as_ptr(),
                 );
@@ -32,11 +30,11 @@ macro_rules! log_info {
 
 macro_rules! log_error {
     ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        if let Ok(c_msg) = CString::new(msg) {
+        let msg = alloc::format!($($arg)*);
+        if let Ok(c_msg) = alloc::ffi::CString::new(msg) {
             unsafe {
-                sys::furi_log_print_format(
-                    sys::FuriLogLevelError,
+                flipperzero_sys::furi_log_print_format(
+                    flipperzero_sys::FuriLogLevelError,
                     $crate::protocol_common::TAG.as_ptr(),
                     c_msg.as_ptr(),
                 );
@@ -109,45 +107,47 @@ pub unsafe fn send_command(
     rx_buf: *mut sys::BitBuffer,
     cmd: &[u8],
 ) -> bool {
-    // Log command (first 6 bytes max for brevity)
-    let cmd_preview: Vec<u8> = cmd.iter().take(6).copied().collect();
-    log_info!("TX: {:02X?} (len={})", cmd_preview, cmd.len());
+    unsafe {
+        // Log command (first 6 bytes max for brevity)
+        let cmd_preview: Vec<u8> = cmd.iter().take(6).copied().collect();
+        log_info!("TX: {:02X?} (len={})", cmd_preview, cmd.len());
 
-    sys::bit_buffer_reset(tx_buf);
-    sys::bit_buffer_reset(rx_buf);
-    sys::bit_buffer_copy_bytes(tx_buf, cmd.as_ptr(), cmd.len());
+        sys::bit_buffer_reset(tx_buf);
+        sys::bit_buffer_reset(rx_buf);
+        sys::bit_buffer_copy_bytes(tx_buf, cmd.as_ptr(), cmd.len());
 
-    let error = sys::iso14443_4a_poller_send_block(poller, tx_buf, rx_buf);
-    if error != sys::Iso14443_4aErrorNone {
-        // Error codes: 0=None, 1=NotPresent, 2=Protocol, 3=Timeout
-        log_error!("NFC send error code: {}", error.0);
-        return false;
-    }
-
-    // Log response
-    let rx_size = sys::bit_buffer_get_size_bytes(rx_buf);
-    if rx_size > 0 {
-        let mut rx_bytes = Vec::new();
-        for i in 0..core::cmp::min(rx_size, 8) {
-            rx_bytes.push(sys::bit_buffer_get_byte(rx_buf, i));
+        let error = sys::iso14443_4a_poller_send_block(poller, tx_buf, rx_buf);
+        if error != sys::Iso14443_4aErrorNone {
+            // Error codes: 0=None, 1=NotPresent, 2=Protocol, 3=Timeout
+            log_error!("NFC send error code: {}", error.0);
+            return false;
         }
-        log_info!("RX: {:02X?} (len={})", rx_bytes, rx_size);
-    } else {
-        log_info!("RX: empty");
-    }
 
-    // Check for success response (0x90 0x00) at the END of response
-    // APDU response format is [DATA...] [SW1] [SW2]
-    if rx_size >= 2 {
-        let sw1 = sys::bit_buffer_get_byte(rx_buf, rx_size - 2);
-        let sw2 = sys::bit_buffer_get_byte(rx_buf, rx_size - 1);
-        let success = sw1 == 0x90 && sw2 == 0x00;
-        if !success {
-            log_error!("Bad response: SW1={:02X} SW2={:02X}", sw1, sw2);
+        // Log response
+        let rx_size = sys::bit_buffer_get_size_bytes(rx_buf);
+        if rx_size > 0 {
+            let mut rx_bytes = Vec::new();
+            for i in 0..core::cmp::min(rx_size, 8) {
+                rx_bytes.push(sys::bit_buffer_get_byte(rx_buf, i));
+            }
+            log_info!("RX: {:02X?} (len={})", rx_bytes, rx_size);
+        } else {
+            log_info!("RX: empty");
         }
-        success
-    } else {
-        true // Some commands may have minimal response
+
+        // Check for success response (0x90 0x00) at the END of response
+        // APDU response format is [DATA...] [SW1] [SW2]
+        if rx_size >= 2 {
+            let sw1 = sys::bit_buffer_get_byte(rx_buf, rx_size - 2);
+            let sw2 = sys::bit_buffer_get_byte(rx_buf, rx_size - 1);
+            let success = sw1 == 0x90 && sw2 == 0x00;
+            if !success {
+                log_error!("Bad response: SW1={:02X} SW2={:02X}", sw1, sw2);
+            }
+            success
+        } else {
+            true // Some commands may have minimal response
+        }
     }
 }
 
@@ -158,8 +158,10 @@ pub unsafe fn send_select_register(
     rx_buf: *mut sys::BitBuffer,
     reg: u8,
 ) -> bool {
-    let cmd = [0x74, 0x99, 0x00, 0x0D, 0x01, reg];
-    send_command(poller, tx_buf, rx_buf, &cmd)
+    unsafe {
+        let cmd = [0x74, 0x99, 0x00, 0x0D, 0x01, reg];
+        send_command(poller, tx_buf, rx_buf, &cmd)
+    }
 }
 
 /// Helper: Send a write data command (74 9A 00 0E LEN DATA...)
@@ -169,14 +171,16 @@ pub unsafe fn send_write_data(
     rx_buf: *mut sys::BitBuffer,
     data: &[u8],
 ) -> bool {
-    let mut cmd = [0u8; 260];
-    cmd[0] = 0x74;
-    cmd[1] = 0x9A;
-    cmd[2] = 0x00;
-    cmd[3] = 0x0E;
-    cmd[4] = data.len() as u8;
-    cmd[5..5 + data.len()].copy_from_slice(data);
-    send_command(poller, tx_buf, rx_buf, &cmd[..5 + data.len()])
+    unsafe {
+        let mut cmd = [0u8; 260];
+        cmd[0] = 0x74;
+        cmd[1] = 0x9A;
+        cmd[2] = 0x00;
+        cmd[3] = 0x0E;
+        cmd[4] = data.len() as u8;
+        cmd[5..5 + data.len()].copy_from_slice(data);
+        send_command(poller, tx_buf, rx_buf, &cmd[..5 + data.len()])
+    }
 }
 
 /// Helper: Send an image data packet from a buffer
@@ -192,15 +196,17 @@ pub unsafe fn send_image_packet_raw(
     offset: usize,
     chunk_len: usize,
 ) -> bool {
-    let mut packet = [0u8; 128]; // 5 header + up to 64 data + margin
-    packet[0] = 0x74;
-    packet[1] = 0x9A;
-    packet[2] = 0x00;
-    packet[3] = 0x0E;
-    packet[4] = chunk_len as u8;
+    unsafe {
+        let mut packet = [0u8; 128]; // 5 header + up to 64 data + margin
+        packet[0] = 0x74;
+        packet[1] = 0x9A;
+        packet[2] = 0x00;
+        packet[3] = 0x0E;
+        packet[4] = chunk_len as u8;
 
-    let src = image_data.add(offset);
-    core::ptr::copy_nonoverlapping(src, packet[5..].as_mut_ptr(), chunk_len);
+        let src = image_data.add(offset);
+        core::ptr::copy_nonoverlapping(src, packet[5..].as_mut_ptr(), chunk_len);
 
-    send_command(poller, tx_buf, rx_buf, &packet[..5 + chunk_len])
+        send_command(poller, tx_buf, rx_buf, &packet[..5 + chunk_len])
+    }
 }

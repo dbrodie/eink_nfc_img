@@ -134,89 +134,93 @@ fn map_to_bwr_color(r: u8, g: u8, b: u8) -> (bool, bool) {
 unsafe fn read_bmp_headers(
     path: *const c_char,
 ) -> ImageResult<(*mut sys::File, *mut sys::Storage, usize, bool)> {
-    // Open file
-    let storage = sys::furi_record_open(c_str!("storage")) as *mut sys::Storage;
-    let file = sys::storage_file_alloc(storage);
+    unsafe {
+        // Open file
+        let storage = sys::furi_record_open(c_str!("storage")) as *mut sys::Storage;
+        let file = sys::storage_file_alloc(storage);
 
-    if !sys::storage_file_open(
-        file,
-        path,
-        sys::FSAM_READ,
-        sys::FSOM_OPEN_EXISTING,
-    ) {
-        sys::storage_file_free(file);
-        sys::furi_record_close(c_str!("storage"));
-        return Err(ImageError::OpenFailed);
+        if !sys::storage_file_open(
+            file,
+            path,
+            sys::FSAM_READ,
+            sys::FSOM_OPEN_EXISTING,
+        ) {
+            sys::storage_file_free(file);
+            sys::furi_record_close(c_str!("storage"));
+            return Err(ImageError::OpenFailed);
+        }
+
+        // Read BMP file header (14 bytes)
+        let mut file_header = [0u8; BMP_FILE_HEADER_SIZE];
+        let read = sys::storage_file_read(file, file_header.as_mut_ptr() as *mut _, BMP_FILE_HEADER_SIZE);
+        if read != BMP_FILE_HEADER_SIZE {
+            sys::storage_file_close(file);
+            sys::storage_file_free(file);
+            sys::furi_record_close(c_str!("storage"));
+            return Err(ImageError::ReadFailed);
+        }
+
+        // Check BMP magic "BM"
+        if file_header[0] != b'B' || file_header[1] != b'M' {
+            sys::storage_file_close(file);
+            sys::storage_file_free(file);
+            sys::furi_record_close(c_str!("storage"));
+            return Err(ImageError::InvalidFormat);
+        }
+
+        // Get pixel data offset from file header
+        let _pixel_offset = u32::from_le_bytes([file_header[10], file_header[11], file_header[12], file_header[13]]) as usize;
+
+        // Read BMP info header (40 bytes)
+        let mut info_header = [0u8; BMP_INFO_HEADER_SIZE];
+        let read = sys::storage_file_read(file, info_header.as_mut_ptr() as *mut _, BMP_INFO_HEADER_SIZE);
+        if read != BMP_INFO_HEADER_SIZE {
+            sys::storage_file_close(file);
+            sys::storage_file_free(file);
+            sys::furi_record_close(c_str!("storage"));
+            return Err(ImageError::ReadFailed);
+        }
+
+        // Parse dimensions
+        let width = i32::from_le_bytes([info_header[4], info_header[5], info_header[6], info_header[7]]);
+        let height = i32::from_le_bytes([info_header[8], info_header[9], info_header[10], info_header[11]]);
+        let bits_per_pixel = u16::from_le_bytes([info_header[14], info_header[15]]);
+
+        // Validate dimensions (height can be negative for top-down DIB)
+        let abs_height = height.abs() as usize;
+        if width as usize != DISPLAY_WIDTH || abs_height != DISPLAY_HEIGHT {
+            sys::storage_file_close(file);
+            sys::storage_file_free(file);
+            sys::furi_record_close(c_str!("storage"));
+            return Err(ImageError::InvalidSize);
+        }
+
+        // Must be 8-bit indexed
+        if bits_per_pixel != 8 {
+            sys::storage_file_close(file);
+            sys::storage_file_free(file);
+            sys::furi_record_close(c_str!("storage"));
+            return Err(ImageError::InvalidFormat);
+        }
+
+        // BMP can be bottom-up (positive height) or top-down (negative height)
+        let bottom_up = height > 0;
+
+        // BMP rows are padded to 4-byte boundaries
+        let row_size = (DISPLAY_WIDTH + 3) & !3;
+
+        Ok((file, storage, row_size, bottom_up))
     }
-
-    // Read BMP file header (14 bytes)
-    let mut file_header = [0u8; BMP_FILE_HEADER_SIZE];
-    let read = sys::storage_file_read(file, file_header.as_mut_ptr() as *mut _, BMP_FILE_HEADER_SIZE);
-    if read != BMP_FILE_HEADER_SIZE {
-        sys::storage_file_close(file);
-        sys::storage_file_free(file);
-        sys::furi_record_close(c_str!("storage"));
-        return Err(ImageError::ReadFailed);
-    }
-
-    // Check BMP magic "BM"
-    if file_header[0] != b'B' || file_header[1] != b'M' {
-        sys::storage_file_close(file);
-        sys::storage_file_free(file);
-        sys::furi_record_close(c_str!("storage"));
-        return Err(ImageError::InvalidFormat);
-    }
-
-    // Get pixel data offset from file header
-    let _pixel_offset = u32::from_le_bytes([file_header[10], file_header[11], file_header[12], file_header[13]]) as usize;
-
-    // Read BMP info header (40 bytes)
-    let mut info_header = [0u8; BMP_INFO_HEADER_SIZE];
-    let read = sys::storage_file_read(file, info_header.as_mut_ptr() as *mut _, BMP_INFO_HEADER_SIZE);
-    if read != BMP_INFO_HEADER_SIZE {
-        sys::storage_file_close(file);
-        sys::storage_file_free(file);
-        sys::furi_record_close(c_str!("storage"));
-        return Err(ImageError::ReadFailed);
-    }
-
-    // Parse dimensions
-    let width = i32::from_le_bytes([info_header[4], info_header[5], info_header[6], info_header[7]]);
-    let height = i32::from_le_bytes([info_header[8], info_header[9], info_header[10], info_header[11]]);
-    let bits_per_pixel = u16::from_le_bytes([info_header[14], info_header[15]]);
-
-    // Validate dimensions (height can be negative for top-down DIB)
-    let abs_height = height.abs() as usize;
-    if width as usize != DISPLAY_WIDTH || abs_height != DISPLAY_HEIGHT {
-        sys::storage_file_close(file);
-        sys::storage_file_free(file);
-        sys::furi_record_close(c_str!("storage"));
-        return Err(ImageError::InvalidSize);
-    }
-
-    // Must be 8-bit indexed
-    if bits_per_pixel != 8 {
-        sys::storage_file_close(file);
-        sys::storage_file_free(file);
-        sys::furi_record_close(c_str!("storage"));
-        return Err(ImageError::InvalidFormat);
-    }
-
-    // BMP can be bottom-up (positive height) or top-down (negative height)
-    let bottom_up = height > 0;
-
-    // BMP rows are padded to 4-byte boundaries
-    let row_size = (DISPLAY_WIDTH + 3) & !3;
-
-    Ok((file, storage, row_size, bottom_up))
 }
 
 /// Close BMP file and release resources
 unsafe fn close_bmp_file(file: *mut sys::File, storage: *mut sys::Storage) {
-    sys::storage_file_close(file);
-    sys::storage_file_free(file);
-    let _ = storage; // storage is from furi_record_open
-    sys::furi_record_close(c_str!("storage"));
+    unsafe {
+        sys::storage_file_close(file);
+        sys::storage_file_free(file);
+        let _ = storage; // storage is from furi_record_open
+        sys::furi_record_close(c_str!("storage"));
+    }
 }
 
 /// Load an 8-bit indexed BMP file and encode as BWRY 4-color
