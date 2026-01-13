@@ -14,7 +14,8 @@ The NFC protocol was reverse-engineered from the official Android app (`DMPL0154
 |------|---------|
 | `src/main.rs` | Application entry point, GUI (ViewDispatcher, Submenu, Widget) |
 | `src/protocol.rs` | NFC protocol implementation using callback-based poller API |
-| `src/image.rs` | Image loading from SD card (.4ei format) |
+| `src/image.rs` | Image loading from SD card (8-bit indexed BMP format) |
+| `scripts/convert_to_bmp.py` | Python script to convert images to compatible BMP format |
 
 ## Building
 
@@ -44,19 +45,44 @@ Output: `target/thumbv7em-none-eabihf/release/dmpl0154fn1.fap`
 - **Interface**: NFC IsoDep (ISO 14443-4)
 - **NFC IC**: FM1280
 
-## Image Format (.4ei)
+## Image Format (BMP)
 
+The app loads standard 8-bit indexed BMP files with a 4-color palette:
+
+| Palette Index | Color |
+|---------------|-------|
+| 0 | Black (0, 0, 0) |
+| 1 | White (255, 255, 255) |
+| 2 | Yellow (255, 255, 0) |
+| 3 | Red (255, 0, 0) |
+
+Requirements:
+- 200x200 pixels
+- 8-bit indexed color (256 color palette)
+- Uncompressed (BI_RGB)
+- Only first 4 palette entries are used
+
+These BMP files can be viewed in any standard image viewer.
+
+### Converting Images
+
+Use the provided Python script:
+
+```bash
+# Install dependencies
+pip install pillow numpy
+
+# Convert with dithering (recommended for photos)
+python scripts/convert_to_bmp.py input.png output.bmp --dither
+
+# Convert without dithering (for graphics with solid colors)
+python scripts/convert_to_bmp.py input.png output.bmp
+
+# Create a test pattern
+python scripts/convert_to_bmp.py test test.bmp
 ```
-Offset  Size   Description
-0       4      Magic: "4EI1"
-4       2      Width (little-endian, 200)
-6       2      Height (little-endian, 200)
-8       10000  Pixel data (2 bits per pixel)
-```
 
-Pixel encoding (2 bits): Black=0, White=1, Yellow=2, Red=3
-
-Place `.4ei` files in `/ext/eink/` on the Flipper SD card.
+Place `.bmp` files in `/ext/eink/` on the Flipper SD card.
 
 ## NFC Protocol Summary
 

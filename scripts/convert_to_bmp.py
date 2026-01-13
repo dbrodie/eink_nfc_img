@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Convert images to .4ei format for DMPL0154FN1 e-ink display.
+Convert images to 8-bit indexed BMP format for DMPL0154FN1 e-ink display.
 
 Usage:
-    python convert_to_4ei.py input.png output.4ei
-    python convert_to_4ei.py input.jpg output.4ei --dither
+    python convert_to_bmp.py input.png output.bmp
+    python convert_to_bmp.py input.jpg output.bmp --dither
+    python convert_to_bmp.py test output.bmp  # Create test pattern
 """
 
 import sys
-import struct
 from pathlib import Path
 
 try:
@@ -30,12 +30,12 @@ PALETTE = {
     'red':    (255, 0, 0),
 }
 
-# 2-bit color codes
-COLOR_CODES = {
-    'black':  0b00,
-    'white':  0b01,
-    'yellow': 0b10,
-    'red':    0b11,
+# Palette index mapping (for BMP palette order)
+PALETTE_INDICES = {
+    'black':  0,
+    'white':  1,
+    'yellow': 2,
+    'red':    3,
 }
 
 def color_distance(c1, c2):
@@ -55,26 +55,18 @@ def nearest_color(rgb):
 
 def floyd_steinberg_dither(img):
     """Apply Floyd-Steinberg dithering to convert to 4-color palette."""
-    # Convert to numpy array for faster processing
     pixels = np.array(img, dtype=np.float32)
     height, width = pixels.shape[:2]
-
-    # Output array
     output = np.zeros((height, width), dtype=np.uint8)
 
     for y in range(height):
         for x in range(width):
             old_pixel = pixels[y, x].copy()
-
-            # Find nearest color
             color_name = nearest_color(tuple(old_pixel.astype(int)))
             new_pixel = np.array(PALETTE[color_name], dtype=np.float32)
-            output[y, x] = COLOR_CODES[color_name]
+            output[y, x] = PALETTE_INDICES[color_name]
 
-            # Calculate error
             error = old_pixel - new_pixel
-
-            # Distribute error to neighboring pixels (Floyd-Steinberg coefficients)
             if x + 1 < width:
                 pixels[y, x + 1] += error * 7 / 16
             if y + 1 < height:
@@ -95,41 +87,34 @@ def simple_quantize(img):
     for y in range(height):
         for x in range(width):
             color_name = nearest_color(tuple(pixels[y, x]))
-            output[y, x] = COLOR_CODES[color_name]
+            output[y, x] = PALETTE_INDICES[color_name]
 
     return output
 
-def pack_pixels(color_array):
-    """Pack 2-bit pixels into bytes (4 pixels per byte, MSB first)."""
-    height, width = color_array.shape
-    bytes_per_row = width // 4
+def create_indexed_bmp(color_array, output_path):
+    """Create an 8-bit indexed BMP with 4-color palette."""
+    # Create palette image
+    palette_data = []
+    for name in ['black', 'white', 'yellow', 'red']:
+        palette_data.extend(PALETTE[name])
+    # Fill rest of 256-color palette with black
+    palette_data.extend([0] * (256 - 4) * 3)
 
-    data = bytearray(height * bytes_per_row)
-
-    for y in range(height):
-        for x_byte in range(bytes_per_row):
-            byte_val = 0
-            for bit in range(4):
-                x = x_byte * 4 + bit
-                byte_val = (byte_val << 2) | (color_array[y, x] & 0x03)
-            data[y * bytes_per_row + x_byte] = byte_val
-
-    return bytes(data)
+    # Create indexed image
+    img = Image.fromarray(color_array, mode='P')
+    img.putpalette(palette_data)
+    img.save(output_path, 'BMP')
 
 def convert_image(input_path, output_path, use_dither=True):
-    """Convert an image to .4ei format."""
-    # Load image
+    """Convert an image to 8-bit indexed BMP format."""
     img = Image.open(input_path)
 
-    # Convert to RGB if necessary
     if img.mode != 'RGB':
         img = img.convert('RGB')
 
-    # Resize to display dimensions
     if img.size != (WIDTH, HEIGHT):
         img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
 
-    # Quantize to 4-color palette
     if use_dither:
         print("Applying Floyd-Steinberg dithering...")
         color_array = floyd_steinberg_dither(img)
@@ -137,20 +122,8 @@ def convert_image(input_path, output_path, use_dither=True):
         print("Applying simple quantization...")
         color_array = simple_quantize(img)
 
-    # Pack pixels into bytes
-    packed_data = pack_pixels(color_array)
-
-    # Write .4ei file
-    with open(output_path, 'wb') as f:
-        # Header
-        f.write(b'4EI1')  # Magic
-        f.write(struct.pack('<H', WIDTH))   # Width (little-endian)
-        f.write(struct.pack('<H', HEIGHT))  # Height (little-endian)
-        # Image data
-        f.write(packed_data)
-
+    create_indexed_bmp(color_array, output_path)
     print(f"Converted {input_path} -> {output_path}")
-    print(f"Output size: {8 + len(packed_data)} bytes")
 
 def create_test_pattern(output_path):
     """Create a test pattern image with colored stripes."""
@@ -162,54 +135,22 @@ def create_test_pattern(output_path):
         for x in range(WIDTH):
             color_array[y, x] = color % 4
 
-    packed_data = pack_pixels(color_array)
-
-    with open(output_path, 'wb') as f:
-        f.write(b'4EI1')
-        f.write(struct.pack('<H', WIDTH))
-        f.write(struct.pack('<H', HEIGHT))
-        f.write(packed_data)
-
+    create_indexed_bmp(color_array, output_path)
     print(f"Created test pattern: {output_path}")
 
 def main():
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 3:
         print(__doc__)
-        print("\nCommands:")
-        print("  convert <input> <output.4ei> [--dither]")
-        print("  test <output.4ei>  - Create a test pattern")
         sys.exit(1)
 
-    command = sys.argv[1]
+    input_arg = sys.argv[1]
+    output_path = sys.argv[2]
+    use_dither = '--dither' in sys.argv
 
-    if command == 'test':
-        if len(sys.argv) < 3:
-            print("Usage: python convert_to_4ei.py test output.4ei")
-            sys.exit(1)
-        create_test_pattern(sys.argv[2])
-
-    elif command == 'convert' or command not in ['test']:
-        # Handle both "convert input output" and "input output" forms
-        if command == 'convert':
-            if len(sys.argv) < 4:
-                print("Usage: python convert_to_4ei.py convert input.png output.4ei [--dither]")
-                sys.exit(1)
-            input_path = sys.argv[2]
-            output_path = sys.argv[3]
-            use_dither = '--dither' in sys.argv
-        else:
-            if len(sys.argv) < 3:
-                print("Usage: python convert_to_4ei.py input.png output.4ei [--dither]")
-                sys.exit(1)
-            input_path = sys.argv[1]
-            output_path = sys.argv[2]
-            use_dither = '--dither' in sys.argv
-
-        convert_image(input_path, output_path, use_dither)
-
+    if input_arg == 'test':
+        create_test_pattern(output_path)
     else:
-        print(f"Unknown command: {command}")
-        sys.exit(1)
+        convert_image(input_arg, output_path, use_dither)
 
 if __name__ == '__main__':
     main()

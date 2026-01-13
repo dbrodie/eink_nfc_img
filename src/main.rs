@@ -287,16 +287,16 @@ impl App {
 
             // Allocate path string
             let path = sys::furi_string_alloc();
-            sys::furi_string_set_str(path, c_str!("/ext/eink"));
+            sys::furi_string_set_str(path, c_str!("/ext"));
 
             // Configure file browser
             let mut options: sys::DialogsFileBrowserOptions = core::mem::zeroed();
             sys::dialog_file_browser_set_basic_options(
                 &mut options,
-                c_str!(".4ei"),
+                c_str!(".bmp"),
                 null_mut(),
             );
-            options.base_path = c_str!("/ext/eink");
+            options.base_path = c_str!("/ext");
             options.hide_dot_files = true;
 
             // Show file browser
@@ -305,7 +305,7 @@ impl App {
                 let path_ptr = sys::furi_string_get_cstr(path);
 
                 // Try to load the image
-                match image::load_4ei_file(path_ptr) {
+                match image::load_bmp_file(path_ptr) {
                     Ok(data) => {
                         self.image_data = Some(data);
                         // Cleanup and show write menu
