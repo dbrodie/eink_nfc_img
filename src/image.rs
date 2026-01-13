@@ -40,6 +40,7 @@ const BMP_FILE_HEADER_SIZE: usize = 14;
 const BMP_INFO_HEADER_SIZE: usize = 40;
 
 /// Marker trait for image formats
+#[allow(dead_code)]
 pub trait ImageFormatMarker {
     /// Runtime format identifier
     const FORMAT: ImageFormat;
@@ -65,6 +66,7 @@ pub struct Image<F: ImageFormatMarker> {
 
 impl<F: ImageFormatMarker> Image<F> {
     /// Get raw pointer to image data
+    #[allow(dead_code)]
     pub fn as_ptr(&self) -> *const u8 {
         self.data.as_ptr()
     }

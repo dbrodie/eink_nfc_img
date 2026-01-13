@@ -31,6 +31,7 @@ pub enum Protocol {
 
 /// Tag type combining display info, image format, and protocol
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct TagType {
     /// Human-readable display name
     pub name: &'static str,

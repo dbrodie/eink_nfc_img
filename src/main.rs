@@ -130,7 +130,7 @@ impl App {
             );
 
             // Add tag selection menu items
-            for (idx, tag) in TagType::ALL.iter().enumerate() {
+            for (idx, _tag) in TagType::ALL.iter().enumerate() {
                 // Create C string for tag name
                 // Note: tag.name is &'static str, we need to make it a C string
                 let name_cstr = match idx {

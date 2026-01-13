@@ -17,6 +17,7 @@ macro_rules! log_info {
     ($($arg:tt)*) => {{
         let msg = alloc::format!($($arg)*);
         if let Ok(c_msg) = alloc::ffi::CString::new(msg) {
+            #[allow(unused_unsafe)]
             unsafe {
                 flipperzero_sys::furi_log_print_format(
                     flipperzero_sys::FuriLogLevelInfo,
@@ -32,6 +33,7 @@ macro_rules! log_error {
     ($($arg:tt)*) => {{
         let msg = alloc::format!($($arg)*);
         if let Ok(c_msg) = alloc::ffi::CString::new(msg) {
+            #[allow(unused_unsafe)]
             unsafe {
                 flipperzero_sys::furi_log_print_format(
                     flipperzero_sys::FuriLogLevelError,
