@@ -52,10 +52,11 @@ pub const DISPLAY_HEIGHT: usize = 200;
 pub const IMAGE_DATA_SIZE: usize = 10_000;
 
 /// Chunk size for data transfer
-pub const CHUNK_SIZE: usize = 250;
+/// Note: Reduced from 250 to 64 bytes due to ISO 14443-4 frame size limits
+pub const CHUNK_SIZE: usize = 64;
 
-/// Number of data packets (10000 / 250 = 40)
-pub const NUM_PACKETS: usize = IMAGE_DATA_SIZE / CHUNK_SIZE;
+/// Number of data packets (10000 / 64 = 157, rounded up)
+pub const NUM_PACKETS: usize = (IMAGE_DATA_SIZE + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
 /// NFC operation errors
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -454,11 +455,14 @@ impl Dmpl0154Protocol {
                 PollerState::PollStatus => {
                     // Poll busy status
                     if Self::send_command(poller, ctx, commands::READ_STATUS) {
-                        // Check if display is ready (non-zero response)
+                        // Response format: [STATUS_BYTE, SW1, SW2]
+                        // STATUS_BYTE: 0x00 = busy, non-zero = ready
                         let rx_size = sys::bit_buffer_get_size_bytes(ctx.rx_buf);
-                        if rx_size > 0 {
-                            let first_byte = sys::bit_buffer_get_byte(ctx.rx_buf, 0);
-                            if first_byte != 0x00 {
+                        if rx_size >= 3 {
+                            let status_byte = sys::bit_buffer_get_byte(ctx.rx_buf, 0);
+                            log_info!("Status poll: byte={:02X}", status_byte);
+                            if status_byte != 0x00 {
+                                log_info!("Display ready!");
                                 ctx.state = PollerState::Cleanup02Select;
                             } else {
                                 // Still busy, wait and poll again
@@ -466,6 +470,8 @@ impl Dmpl0154Protocol {
                                 // Stay in PollStatus state
                             }
                         } else {
+                            // Unexpected response length, assume ready
+                            log_info!("Unexpected status response len={}, assuming ready", rx_size);
                             ctx.state = PollerState::Cleanup02Select;
                         }
                     } else {
@@ -550,10 +556,11 @@ impl Dmpl0154Protocol {
                 log_info!("RX: empty");
             }
 
-            // Check for success response (0x90 0x00)
+            // Check for success response (0x90 0x00) at the END of response
+            // APDU response format is [DATA...] [SW1] [SW2]
             if rx_size >= 2 {
-                let sw1 = sys::bit_buffer_get_byte(ctx.rx_buf, 0);
-                let sw2 = sys::bit_buffer_get_byte(ctx.rx_buf, 1);
+                let sw1 = sys::bit_buffer_get_byte(ctx.rx_buf, rx_size - 2);
+                let sw2 = sys::bit_buffer_get_byte(ctx.rx_buf, rx_size - 1);
                 let success = sw1 == 0x90 && sw2 == 0x00;
                 if !success {
                     log_error!("Bad response: SW1={:02X} SW2={:02X}", sw1, sw2);
@@ -602,18 +609,22 @@ impl Dmpl0154Protocol {
         packet_idx: usize,
     ) -> bool {
         unsafe {
-            let mut packet = [0u8; 255];
+            let offset = packet_idx * CHUNK_SIZE;
+            // Handle last packet which may be smaller
+            let remaining = IMAGE_DATA_SIZE - offset;
+            let chunk_len = core::cmp::min(CHUNK_SIZE, remaining);
+
+            let mut packet = [0u8; 128]; // 5 header + up to 64 data + margin
             packet[0] = 0x74;
             packet[1] = 0x9A;
             packet[2] = 0x00;
             packet[3] = 0x0E;
-            packet[4] = 0xFA; // 250 bytes
+            packet[4] = chunk_len as u8;
 
-            let offset = packet_idx * CHUNK_SIZE;
             let src = ctx.image_data.add(offset);
-            core::ptr::copy_nonoverlapping(src, packet[5..].as_mut_ptr(), CHUNK_SIZE);
+            core::ptr::copy_nonoverlapping(src, packet[5..].as_mut_ptr(), chunk_len);
 
-            Self::send_command(poller, ctx, &packet)
+            Self::send_command(poller, ctx, &packet[..5 + chunk_len])
         }
     }
 }
