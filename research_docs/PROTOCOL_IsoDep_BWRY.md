@@ -39,8 +39,12 @@
 ### Response Format
 
 ```
-[SW1] [SW2] [Data...]
+[Data...] [SW1] [SW2]
 ```
+
+Status words are at the END of the response (standard ISO 7816-4 APDU format).
+For commands with no data, response is just `[SW1] [SW2]`.
+For READ_STATUS, response is `[STATUS] [SW1] [SW2]` where STATUS byte comes first.
 
 | Response | Meaning |
 |----------|---------|

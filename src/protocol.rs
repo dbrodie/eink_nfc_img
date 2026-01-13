@@ -52,7 +52,9 @@ pub const DISPLAY_HEIGHT: usize = 200;
 pub const IMAGE_DATA_SIZE: usize = 10_000;
 
 /// Chunk size for data transfer
-/// Note: Reduced from 250 to 64 bytes due to ISO 14443-4 frame size limits
+///
+/// Note: The original Android app uses 250-byte chunks (see PROTOCOL_IsoDep_BWRY.md).
+/// Reduced to 64 bytes here due to Flipper Zero's ISO 14443-4 frame size limits.
 pub const CHUNK_SIZE: usize = 64;
 
 /// Number of data packets (10000 / 64 = 157, rounded up)
@@ -429,6 +431,8 @@ impl Dmpl0154Protocol {
                 PollerState::SendData(packet_idx) => {
                     if Self::send_image_packet(poller, ctx, packet_idx) {
                         if packet_idx + 1 >= NUM_PACKETS {
+                            // Brief delay after final packet before refresh.
+                            // Not in original Android app protocol - added for stability.
                             sys::furi_delay_ms(50);
                             ctx.state = PollerState::Refresh;
                         } else {
