@@ -28,7 +28,8 @@ use tag_type::{Protocol, TagType};
 manifest!(
     name = "E-Ink NFC",
     app_version = 1,
-    has_icon = false,
+    has_icon = true,
+    icon = "../logo.icon",
 );
 entry!(main);
 
