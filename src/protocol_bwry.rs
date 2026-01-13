@@ -1,92 +1,19 @@
-//! NFC IsoDep protocol implementation for DMPL0154FN1 4-color e-ink display
+//! IsoDep BWRY protocol implementation for 4-color e-ink displays
 //!
 //! Protocol reverse-engineered from the official Android app.
-//! See PROTOCOL.md for detailed command documentation.
-//!
-//! Updated for flipperzero-rs v0.16.0 NFC API (callback-based poller model).
+//! See research_docs/PROTOCOL_IsoDep_BWRY.md for detailed documentation.
 
-extern crate alloc;
-
-use alloc::ffi::CString;
-use alloc::format;
 use core::cell::UnsafeCell;
-use core::ffi::CStr;
 use core::ptr::null_mut;
 use flipperzero_sys as sys;
 
-/// Log tag for debugging
-const TAG: &CStr = c"DMPL0154";
+use crate::protocol_common::{
+    self, commands as common_commands, log_error, log_info,
+    NfcError, NfcResult, CHUNK_SIZE, IMAGE_DATA_SIZE, NUM_PACKETS,
+};
 
-/// Helper macro for debug logging
-macro_rules! log_info {
-    ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        if let Ok(c_msg) = CString::new(msg) {
-            sys::furi_log_print_format(
-                sys::FuriLogLevelInfo,
-                TAG.as_ptr(),
-                c_msg.as_ptr(),
-            );
-        }
-    }};
-}
-
-macro_rules! log_error {
-    ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        if let Ok(c_msg) = CString::new(msg) {
-            sys::furi_log_print_format(
-                sys::FuriLogLevelError,
-                TAG.as_ptr(),
-                c_msg.as_ptr(),
-            );
-        }
-    }};
-}
-
-/// Display dimensions
-pub const DISPLAY_WIDTH: usize = 200;
-pub const DISPLAY_HEIGHT: usize = 200;
-
-/// Total image data size (200 * 200 * 2 bits / 8 = 10,000 bytes)
-pub const IMAGE_DATA_SIZE: usize = 10_000;
-
-/// Chunk size for data transfer
-///
-/// Note: The original Android app uses 250-byte chunks (see PROTOCOL_IsoDep_BWRY.md).
-/// Reduced to 64 bytes here due to Flipper Zero's ISO 14443-4 frame size limits.
-pub const CHUNK_SIZE: usize = 64;
-
-/// Number of data packets (10000 / 64 = 157, rounded up)
-pub const NUM_PACKETS: usize = (IMAGE_DATA_SIZE + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
-/// NFC operation errors
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum NfcError {
-    /// Tag detection failed
-    DetectFailed,
-    /// Command transmission failed
-    TransmitFailed,
-    /// Allocation failed
-    AllocFailed,
-}
-
-pub type NfcResult<T> = Result<T, NfcError>;
-
-/// Pre-defined command sequences for DMPL0154FN1
+/// BWRY-specific command sequences
 pub mod commands {
-    /// Authentication/Init: 74 B1 00 00 08 00 11 22 33 44 55 66 77
-    pub const INIT: &[u8] = &[
-        0x74, 0xB1, 0x00, 0x00, 0x08,
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-    ];
-
-    /// GPIO/Power control step 0: 74 97 00 08 00
-    pub const GPIO_0: &[u8] = &[0x74, 0x97, 0x00, 0x08, 0x00];
-
-    /// GPIO/Power control step 1: 74 97 01 08 00
-    pub const GPIO_1: &[u8] = &[0x74, 0x97, 0x01, 0x08, 0x00];
-
     /// Display initialization: 74 00 15 00 00
     pub const DISPLAY_INIT: &[u8] = &[0x74, 0x00, 0x15, 0x00, 0x00];
 
@@ -95,9 +22,6 @@ pub mod commands {
 
     /// Trigger display refresh: 74 02 15 02 00
     pub const REFRESH: &[u8] = &[0x74, 0x02, 0x15, 0x02, 0x00];
-
-    /// Read busy status: 74 9B 00 0F 01
-    pub const READ_STATUS: &[u8] = &[0x74, 0x9B, 0x00, 0x0F, 0x01];
 
     /// Register configurations for 4-color mode
     /// Register 0xE0 = 0x02
@@ -156,15 +80,15 @@ struct PollerContext {
     rx_buf: *mut sys::BitBuffer,
 }
 
-/// Protocol handler for DMPL0154FN1 NFC e-ink display
-pub struct Dmpl0154Protocol {
+/// Protocol handler for BWRY (4-color) NFC e-ink displays
+pub struct BwryProtocol {
     nfc: *mut sys::Nfc,
     poller: *mut sys::NfcPoller,
     context: UnsafeCell<PollerContext>,
     result: NfcResult<()>,
 }
 
-impl Dmpl0154Protocol {
+impl BwryProtocol {
     /// Create a new protocol handler
     pub fn new() -> Self {
         Self {
@@ -238,13 +162,13 @@ impl Dmpl0154Protocol {
 
     /// Write image data to the display
     ///
-    /// This executes the full protocol sequence using the NFC poller API:
+    /// This executes the full BWRY protocol sequence:
     /// 1. Initialize communication
-    /// 2. Configure display registers
-    /// 3. Transfer image data in 250-byte chunks
+    /// 2. Configure display registers (E0, E6, A5)
+    /// 3. Transfer image data in 64-byte chunks
     /// 4. Trigger display refresh
     /// 5. Wait for refresh to complete
-    /// 6. Cleanup
+    /// 6. Cleanup registers
     pub fn write_image(&mut self, image_data: &[u8; IMAGE_DATA_SIZE]) -> NfcResult<()> {
         // Initialize NFC
         self.init_nfc()?;
@@ -289,7 +213,7 @@ impl Dmpl0154Protocol {
         self.result
     }
 
-    /// NFC poller callback - implements the protocol state machine
+    /// NFC poller callback - implements the BWRY protocol state machine
     unsafe extern "C" fn poller_callback(
         event: sys::NfcGenericEvent,
         context: *mut core::ffi::c_void,
@@ -309,7 +233,7 @@ impl Dmpl0154Protocol {
             if ctx.state == PollerState::WaitingForTag {
                 if event_type == sys::Iso14443_4aPollerEventTypeReady {
                     // Tag detected! Transition to Init state
-                    log_info!("Tag detected! Starting protocol...");
+                    log_info!("Tag detected! Starting BWRY protocol...");
                     ctx.state = PollerState::Init;
                     // Fall through to process Init state
                 } else {
@@ -336,7 +260,7 @@ impl Dmpl0154Protocol {
                 }
                 PollerState::Init => {
                     log_info!("State: Init - sending auth command");
-                    if Self::send_command(poller, ctx, commands::INIT) {
+                    if protocol_common::send_command(poller, ctx.tx_buf, ctx.rx_buf, common_commands::INIT) {
                         ctx.state = PollerState::Gpio0;
                     } else {
                         log_error!("Init command failed!");
@@ -345,7 +269,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::Gpio0 => {
-                    if Self::send_command(poller, ctx, commands::GPIO_0) {
+                    if protocol_common::send_command(poller, ctx.tx_buf, ctx.rx_buf, common_commands::GPIO_0) {
                         sys::furi_delay_ms(50);
                         ctx.state = PollerState::Gpio1;
                     } else {
@@ -354,8 +278,8 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::Gpio1 => {
-                    if Self::send_command(poller, ctx, commands::GPIO_1) {
-                        sys::furi_delay_ms(200);
+                    if protocol_common::send_command(poller, ctx.tx_buf, ctx.rx_buf, common_commands::GPIO_1) {
+                        sys::furi_delay_ms(200); // BWRY uses 200ms delay
                         ctx.state = PollerState::DisplayInit;
                     } else {
                         ctx.state = PollerState::Error(NfcError::TransmitFailed);
@@ -363,7 +287,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::DisplayInit => {
-                    if Self::send_command(poller, ctx, commands::DISPLAY_INIT) {
+                    if protocol_common::send_command(poller, ctx.tx_buf, ctx.rx_buf, commands::DISPLAY_INIT) {
                         sys::furi_delay_ms(100);
                         ctx.state = PollerState::RegE0Select;
                     } else {
@@ -372,7 +296,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::RegE0Select => {
-                    if Self::send_select_register(poller, ctx, commands::REG_E0) {
+                    if protocol_common::send_select_register(poller, ctx.tx_buf, ctx.rx_buf, commands::REG_E0) {
                         ctx.state = PollerState::RegE0Write;
                     } else {
                         ctx.state = PollerState::Error(NfcError::TransmitFailed);
@@ -380,7 +304,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::RegE0Write => {
-                    if Self::send_write_data(poller, ctx, commands::REG_E0_VAL) {
+                    if protocol_common::send_write_data(poller, ctx.tx_buf, ctx.rx_buf, commands::REG_E0_VAL) {
                         ctx.state = PollerState::RegE6Select;
                     } else {
                         ctx.state = PollerState::Error(NfcError::TransmitFailed);
@@ -388,7 +312,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::RegE6Select => {
-                    if Self::send_select_register(poller, ctx, commands::REG_E6) {
+                    if protocol_common::send_select_register(poller, ctx.tx_buf, ctx.rx_buf, commands::REG_E6) {
                         ctx.state = PollerState::RegE6Write;
                     } else {
                         ctx.state = PollerState::Error(NfcError::TransmitFailed);
@@ -396,7 +320,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::RegE6Write => {
-                    if Self::send_write_data(poller, ctx, commands::REG_E6_VAL) {
+                    if protocol_common::send_write_data(poller, ctx.tx_buf, ctx.rx_buf, commands::REG_E6_VAL) {
                         ctx.state = PollerState::RegA5Select;
                     } else {
                         ctx.state = PollerState::Error(NfcError::TransmitFailed);
@@ -404,7 +328,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::RegA5Select => {
-                    if Self::send_select_register(poller, ctx, commands::REG_A5) {
+                    if protocol_common::send_select_register(poller, ctx.tx_buf, ctx.rx_buf, commands::REG_A5) {
                         ctx.state = PollerState::RegA5Write;
                     } else {
                         ctx.state = PollerState::Error(NfcError::TransmitFailed);
@@ -412,7 +336,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::RegA5Write => {
-                    if Self::send_write_data(poller, ctx, commands::REG_A5_VAL) {
+                    if protocol_common::send_write_data(poller, ctx.tx_buf, ctx.rx_buf, commands::REG_A5_VAL) {
                         sys::furi_delay_ms(100);
                         ctx.state = PollerState::StartTx;
                     } else {
@@ -421,7 +345,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::StartTx => {
-                    if Self::send_command(poller, ctx, commands::START_TX) {
+                    if protocol_common::send_command(poller, ctx.tx_buf, ctx.rx_buf, commands::START_TX) {
                         ctx.state = PollerState::SendData(0);
                     } else {
                         ctx.state = PollerState::Error(NfcError::TransmitFailed);
@@ -429,10 +353,16 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::SendData(packet_idx) => {
-                    if Self::send_image_packet(poller, ctx, packet_idx) {
+                    let offset = packet_idx * CHUNK_SIZE;
+                    let remaining = IMAGE_DATA_SIZE - offset;
+                    let chunk_len = core::cmp::min(CHUNK_SIZE, remaining);
+
+                    if protocol_common::send_image_packet_raw(
+                        poller, ctx.tx_buf, ctx.rx_buf,
+                        ctx.image_data, offset, chunk_len
+                    ) {
                         if packet_idx + 1 >= NUM_PACKETS {
-                            // Brief delay after final packet before refresh.
-                            // Not in original Android app protocol - added for stability.
+                            // Brief delay after final packet before refresh
                             sys::furi_delay_ms(50);
                             ctx.state = PollerState::Refresh;
                         } else {
@@ -444,7 +374,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::Refresh => {
-                    if Self::send_command(poller, ctx, commands::REFRESH) {
+                    if protocol_common::send_command(poller, ctx.tx_buf, ctx.rx_buf, commands::REFRESH) {
                         ctx.state = PollerState::WaitRefresh;
                     } else {
                         ctx.state = PollerState::Error(NfcError::TransmitFailed);
@@ -452,15 +382,15 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::WaitRefresh => {
-                    // Wait for initial refresh (10 seconds)
+                    // Wait for initial refresh (10 seconds for BWRY)
                     sys::furi_delay_ms(10000);
                     ctx.state = PollerState::PollStatus;
                 }
                 PollerState::PollStatus => {
                     // Poll busy status
-                    if Self::send_command(poller, ctx, commands::READ_STATUS) {
+                    if protocol_common::send_command(poller, ctx.tx_buf, ctx.rx_buf, common_commands::READ_STATUS) {
                         // Response format: [STATUS_BYTE, SW1, SW2]
-                        // STATUS_BYTE: 0x00 = busy, non-zero = ready
+                        // STATUS_BYTE: 0x00 = busy, non-zero = ready (BWRY)
                         let rx_size = sys::bit_buffer_get_size_bytes(ctx.rx_buf);
                         if rx_size >= 3 {
                             let status_byte = sys::bit_buffer_get_byte(ctx.rx_buf, 0);
@@ -469,7 +399,7 @@ impl Dmpl0154Protocol {
                                 log_info!("Display ready!");
                                 ctx.state = PollerState::Cleanup02Select;
                             } else {
-                                // Still busy, wait and poll again
+                                // Still busy, wait and poll again (400ms for BWRY)
                                 sys::furi_delay_ms(400);
                                 // Stay in PollStatus state
                             }
@@ -484,7 +414,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::Cleanup02Select => {
-                    if Self::send_select_register(poller, ctx, commands::REG_02) {
+                    if protocol_common::send_select_register(poller, ctx.tx_buf, ctx.rx_buf, commands::REG_02) {
                         ctx.state = PollerState::Cleanup02Write;
                     } else {
                         ctx.state = PollerState::Error(NfcError::TransmitFailed);
@@ -492,7 +422,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::Cleanup02Write => {
-                    if Self::send_write_data(poller, ctx, commands::REG_02_VAL) {
+                    if protocol_common::send_write_data(poller, ctx.tx_buf, ctx.rx_buf, commands::REG_02_VAL) {
                         sys::furi_delay_ms(200);
                         ctx.state = PollerState::Cleanup07Select;
                     } else {
@@ -501,7 +431,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::Cleanup07Select => {
-                    if Self::send_select_register(poller, ctx, commands::REG_07) {
+                    if protocol_common::send_select_register(poller, ctx.tx_buf, ctx.rx_buf, commands::REG_07) {
                         ctx.state = PollerState::Cleanup07Write;
                     } else {
                         ctx.state = PollerState::Error(NfcError::TransmitFailed);
@@ -509,7 +439,7 @@ impl Dmpl0154Protocol {
                     }
                 }
                 PollerState::Cleanup07Write => {
-                    if Self::send_write_data(poller, ctx, commands::REG_07_VAL) {
+                    if protocol_common::send_write_data(poller, ctx.tx_buf, ctx.rx_buf, commands::REG_07_VAL) {
                         ctx.state = PollerState::Done;
                         return sys::NfcCommandStop;
                     } else {
@@ -525,115 +455,9 @@ impl Dmpl0154Protocol {
             sys::NfcCommandContinue
         }
     }
-
-    /// Helper: Send a raw command and check for success
-    unsafe fn send_command(
-        poller: *mut sys::Iso14443_4aPoller,
-        ctx: &mut PollerContext,
-        cmd: &[u8],
-    ) -> bool {
-        unsafe {
-            // Log command (first 6 bytes max for brevity)
-            let cmd_preview: alloc::vec::Vec<u8> = cmd.iter().take(6).copied().collect();
-            log_info!("TX: {:02X?} (len={})", cmd_preview, cmd.len());
-
-            sys::bit_buffer_reset(ctx.tx_buf);
-            sys::bit_buffer_reset(ctx.rx_buf);
-            sys::bit_buffer_copy_bytes(ctx.tx_buf, cmd.as_ptr(), cmd.len());
-
-            let error = sys::iso14443_4a_poller_send_block(poller, ctx.tx_buf, ctx.rx_buf);
-            if error != sys::Iso14443_4aErrorNone {
-                // Error codes: 0=None, 1=NotPresent, 2=Protocol, 3=Timeout
-                log_error!("NFC send error code: {}", error.0);
-                return false;
-            }
-
-            // Log response
-            let rx_size = sys::bit_buffer_get_size_bytes(ctx.rx_buf);
-            if rx_size > 0 {
-                let mut rx_bytes = alloc::vec::Vec::new();
-                for i in 0..core::cmp::min(rx_size, 8) {
-                    rx_bytes.push(sys::bit_buffer_get_byte(ctx.rx_buf, i));
-                }
-                log_info!("RX: {:02X?} (len={})", rx_bytes, rx_size);
-            } else {
-                log_info!("RX: empty");
-            }
-
-            // Check for success response (0x90 0x00) at the END of response
-            // APDU response format is [DATA...] [SW1] [SW2]
-            if rx_size >= 2 {
-                let sw1 = sys::bit_buffer_get_byte(ctx.rx_buf, rx_size - 2);
-                let sw2 = sys::bit_buffer_get_byte(ctx.rx_buf, rx_size - 1);
-                let success = sw1 == 0x90 && sw2 == 0x00;
-                if !success {
-                    log_error!("Bad response: SW1={:02X} SW2={:02X}", sw1, sw2);
-                }
-                success
-            } else {
-                true // Some commands may have minimal response
-            }
-        }
-    }
-
-    /// Helper: Send a select register command
-    unsafe fn send_select_register(
-        poller: *mut sys::Iso14443_4aPoller,
-        ctx: &mut PollerContext,
-        reg: u8,
-    ) -> bool {
-        unsafe {
-            let cmd = [0x74, 0x99, 0x00, 0x0D, 0x01, reg];
-            Self::send_command(poller, ctx, &cmd)
-        }
-    }
-
-    /// Helper: Send a write data command
-    unsafe fn send_write_data(
-        poller: *mut sys::Iso14443_4aPoller,
-        ctx: &mut PollerContext,
-        data: &[u8],
-    ) -> bool {
-        unsafe {
-            let mut cmd = [0u8; 260];
-            cmd[0] = 0x74;
-            cmd[1] = 0x9A;
-            cmd[2] = 0x00;
-            cmd[3] = 0x0E;
-            cmd[4] = data.len() as u8;
-            cmd[5..5 + data.len()].copy_from_slice(data);
-            Self::send_command(poller, ctx, &cmd[..5 + data.len()])
-        }
-    }
-
-    /// Helper: Send an image data packet
-    unsafe fn send_image_packet(
-        poller: *mut sys::Iso14443_4aPoller,
-        ctx: &mut PollerContext,
-        packet_idx: usize,
-    ) -> bool {
-        unsafe {
-            let offset = packet_idx * CHUNK_SIZE;
-            // Handle last packet which may be smaller
-            let remaining = IMAGE_DATA_SIZE - offset;
-            let chunk_len = core::cmp::min(CHUNK_SIZE, remaining);
-
-            let mut packet = [0u8; 128]; // 5 header + up to 64 data + margin
-            packet[0] = 0x74;
-            packet[1] = 0x9A;
-            packet[2] = 0x00;
-            packet[3] = 0x0E;
-            packet[4] = chunk_len as u8;
-
-            let src = ctx.image_data.add(offset);
-            core::ptr::copy_nonoverlapping(src, packet[5..].as_mut_ptr(), chunk_len);
-
-            Self::send_command(poller, ctx, &packet[..5 + chunk_len])
-        }
-    }
 }
 
-impl Drop for Dmpl0154Protocol {
+impl Drop for BwryProtocol {
     fn drop(&mut self) {
         self.cleanup();
     }

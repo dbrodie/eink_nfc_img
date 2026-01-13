@@ -1,6 +1,7 @@
-//! DMPL0154FN1 4-Color E-Ink NFC Writer for Flipper Zero
+//! E-Ink NFC Writer for Flipper Zero
 //!
-//! Writes images to GoodDisplay DMPL0154FN1 NFC-powered e-ink tags.
+//! Writes images to GoodDisplay NFC-powered e-ink tags.
+//! Supports multiple display types and protocols.
 
 #![no_std]
 #![no_main]
@@ -9,18 +10,23 @@ extern crate alloc;
 extern crate flipperzero_alloc;
 
 mod image;
-mod protocol;
+mod protocol_bwry;
+mod protocol_common;
+mod protocol_genb;
+mod tag_type;
 
-use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::null_mut;
 
 use flipperzero_rt::{entry, manifest};
 use flipperzero_sys as sys;
 
+use image::AnyImage;
+use tag_type::{Protocol, TagType};
+
 // App manifest
 manifest!(
-    name = "DMPL0154FN1",
+    name = "E-Ink NFC",
     app_version = 1,
     has_icon = false,
 );
@@ -30,17 +36,20 @@ entry!(main);
 struct App {
     view_dispatcher: *mut sys::ViewDispatcher,
     submenu: *mut sys::Submenu,
+    tag_submenu: *mut sys::Submenu,
     write_submenu: *mut sys::Submenu,
     widget: *mut sys::Widget,
     gui: *mut sys::Gui,
-    image_data: Option<Box<[u8; protocol::IMAGE_DATA_SIZE]>>,
+    selected_tag: Option<&'static TagType>,
+    image_data: Option<AnyImage>,
     current_view: u32,
 }
 
 /// View IDs
 const VIEW_MENU: u32 = 0;
-const VIEW_WRITE_MENU: u32 = 1;
-const VIEW_WIDGET: u32 = 2;
+const VIEW_TAG_MENU: u32 = 1;
+const VIEW_WRITE_MENU: u32 = 2;
+const VIEW_WIDGET: u32 = 3;
 
 /// Main menu item IDs
 const MENU_SELECT_IMAGE: u32 = 0;
@@ -62,9 +71,11 @@ impl App {
         Self {
             view_dispatcher: null_mut(),
             submenu: null_mut(),
+            tag_submenu: null_mut(),
             write_submenu: null_mut(),
             widget: null_mut(),
             gui: null_mut(),
+            selected_tag: None,
             image_data: None,
             current_view: VIEW_MENU,
         }
@@ -81,6 +92,12 @@ impl App {
             // Allocate main submenu
             self.submenu = sys::submenu_alloc();
             if self.submenu.is_null() {
+                return false;
+            }
+
+            // Allocate tag selection submenu
+            self.tag_submenu = sys::submenu_alloc();
+            if self.tag_submenu.is_null() {
                 return false;
             }
 
@@ -112,6 +129,24 @@ impl App {
                 self as *mut _ as *mut c_void,
             );
 
+            // Add tag selection menu items
+            for (idx, tag) in TagType::ALL.iter().enumerate() {
+                // Create C string for tag name
+                // Note: tag.name is &'static str, we need to make it a C string
+                let name_cstr = match idx {
+                    0 => c_str!("1.54inch e-Paper Y"),
+                    1 => c_str!("1.54inch e-Paper B"),
+                    _ => c_str!("Unknown"),
+                };
+                sys::submenu_add_item(
+                    self.tag_submenu,
+                    name_cstr,
+                    idx as u32,
+                    Some(tag_menu_callback),
+                    self as *mut _ as *mut c_void,
+                );
+            }
+
             // Add write menu items
             sys::submenu_add_item(
                 self.write_submenu,
@@ -133,6 +168,11 @@ impl App {
                 self.view_dispatcher,
                 VIEW_MENU,
                 sys::submenu_get_view(self.submenu),
+            );
+            sys::view_dispatcher_add_view(
+                self.view_dispatcher,
+                VIEW_TAG_MENU,
+                sys::submenu_get_view(self.tag_submenu),
             );
             sys::view_dispatcher_add_view(
                 self.view_dispatcher,
@@ -186,12 +226,16 @@ impl App {
         unsafe {
             // Remove views
             sys::view_dispatcher_remove_view(self.view_dispatcher, VIEW_MENU);
+            sys::view_dispatcher_remove_view(self.view_dispatcher, VIEW_TAG_MENU);
             sys::view_dispatcher_remove_view(self.view_dispatcher, VIEW_WRITE_MENU);
             sys::view_dispatcher_remove_view(self.view_dispatcher, VIEW_WIDGET);
 
             // Free resources
             if !self.submenu.is_null() {
                 sys::submenu_free(self.submenu);
+            }
+            if !self.tag_submenu.is_null() {
+                sys::submenu_free(self.tag_submenu);
             }
             if !self.write_submenu.is_null() {
                 sys::submenu_free(self.write_submenu);
@@ -234,6 +278,13 @@ impl App {
         }
     }
 
+    unsafe fn show_tag_menu(&mut self) {
+        unsafe {
+            self.current_view = VIEW_TAG_MENU;
+            sys::view_dispatcher_switch_to_view(self.view_dispatcher, VIEW_TAG_MENU);
+        }
+    }
+
     unsafe fn show_write_menu(&mut self) {
         unsafe {
             self.current_view = VIEW_WRITE_MENU;
@@ -252,15 +303,25 @@ impl App {
         unsafe {
             match index {
                 MENU_SELECT_IMAGE => {
-                    self.select_image();
+                    // Show tag selection menu first
+                    self.show_tag_menu();
                 }
                 MENU_ABOUT => {
                     self.show_message(
-                        c_str!("DMPL0154FN1 Writer"),
-                        c_str!("4-color e-ink NFC tag"),
+                        c_str!("E-Ink NFC Writer"),
+                        c_str!("BWR/BWRY e-ink tags"),
                     );
                 }
                 _ => {}
+            }
+        }
+    }
+
+    unsafe fn on_tag_menu_select(&mut self, index: u32) {
+        unsafe {
+            if let Some(tag) = TagType::get(index as usize) {
+                self.selected_tag = Some(tag);
+                self.select_image();
             }
         }
     }
@@ -273,6 +334,7 @@ impl App {
                 }
                 WRITE_MENU_CANCEL => {
                     self.image_data = None;
+                    self.selected_tag = None;
                     self.show_main_menu();
                 }
                 _ => {}
@@ -282,6 +344,14 @@ impl App {
 
     unsafe fn select_image(&mut self) {
         unsafe {
+            let tag = match self.selected_tag {
+                Some(t) => t,
+                None => {
+                    self.show_main_menu();
+                    return;
+                }
+            };
+
             // Open dialogs app
             let dialogs = sys::furi_record_open(c_str!("dialogs")) as *mut sys::DialogsApp;
 
@@ -304,8 +374,8 @@ impl App {
                 // Get selected path
                 let path_ptr = sys::furi_string_get_cstr(path);
 
-                // Try to load the image
-                match image::load_bmp_file(path_ptr) {
+                // Try to load the image with the appropriate format
+                match image::load_bmp(path_ptr, tag.image_format) {
                     Ok(data) => {
                         self.image_data = Some(data);
                         // Cleanup and show write menu
@@ -328,35 +398,58 @@ impl App {
 
     unsafe fn write_to_tag(&mut self) {
         unsafe {
+            let tag = match self.selected_tag {
+                Some(t) => t,
+                None => {
+                    self.show_message(c_str!("Error"), c_str!("No tag type selected"));
+                    return;
+                }
+            };
+
             if self.image_data.is_none() {
                 self.show_message(c_str!("No Image"), c_str!("Select an image first"));
                 return;
             }
 
-            self.show_message(c_str!("Writing..."), c_str!("Hold tag near Flipper"));
+            // Show writing status
+            let status_msg = match tag.protocol {
+                Protocol::IsodepBwry => c_str!("Writing BWRY..."),
+                Protocol::IsodepGenb => c_str!("Writing BWR..."),
+            };
+            self.show_message(c_str!("Writing..."), status_msg);
 
-            // Get image data
-            let data = self.image_data.as_ref().unwrap();
+            // Get image data and dispatch to appropriate protocol
+            let img = self.image_data.as_ref().unwrap();
 
-            // Create protocol handler
-            let mut proto = protocol::Dmpl0154Protocol::new();
+            let result = match (tag.protocol, img) {
+                (Protocol::IsodepBwry, AnyImage::Bwry(image)) => {
+                    let mut proto = protocol_bwry::BwryProtocol::new();
+                    proto.write_image(image.as_slice())
+                }
+                (Protocol::IsodepGenb, AnyImage::Bwr(image)) => {
+                    let mut proto = protocol_genb::GenbProtocol::new();
+                    proto.write_image(image.as_slice())
+                }
+                _ => {
+                    // This should never happen due to type safety
+                    self.show_message(c_str!("Error"), c_str!("Format mismatch"));
+                    return;
+                }
+            };
 
-            // Attempt to write
-            match proto.write_image(data.as_ref()) {
+            match result {
                 Ok(()) => {
                     self.show_message(c_str!("Success!"), c_str!("Image written to tag"));
                 }
                 Err(e) => {
                     let msg = match e {
-                        protocol::NfcError::DetectFailed => c_str!("Detection failed"),
-                        protocol::NfcError::TransmitFailed => c_str!("Transmit failed"),
-                        protocol::NfcError::AllocFailed => c_str!("Alloc failed"),
+                        protocol_common::NfcError::DetectFailed => c_str!("Detection failed"),
+                        protocol_common::NfcError::TransmitFailed => c_str!("Transmit failed"),
+                        protocol_common::NfcError::AllocFailed => c_str!("Alloc failed"),
                     };
                     self.show_message(c_str!("Error"), msg);
                 }
             }
-
-            proto.cleanup();
         }
     }
 }
@@ -366,6 +459,14 @@ unsafe extern "C" fn menu_callback(context: *mut c_void, index: u32) {
     unsafe {
         let app = &mut *(context as *mut App);
         app.on_menu_select(index);
+    }
+}
+
+/// Tag menu item callback
+unsafe extern "C" fn tag_menu_callback(context: *mut c_void, index: u32) {
+    unsafe {
+        let app = &mut *(context as *mut App);
+        app.on_tag_menu_select(index);
     }
 }
 
@@ -387,13 +488,19 @@ unsafe extern "C" fn navigation_callback(context: *mut c_void) -> bool {
                 // On main menu, exit the app
                 sys::view_dispatcher_stop(app.view_dispatcher);
             }
-            VIEW_WRITE_MENU => {
-                // On write menu, go back to main menu and clear image
-                app.image_data = None;
+            VIEW_TAG_MENU => {
+                // On tag menu, go back to main menu
                 app.show_main_menu();
+            }
+            VIEW_WRITE_MENU => {
+                // On write menu, go back to tag menu and clear image
+                app.image_data = None;
+                app.show_tag_menu();
             }
             _ => {
                 // On other views (widget), go back to main menu
+                app.image_data = None;
+                app.selected_tag = None;
                 app.show_main_menu();
             }
         }
