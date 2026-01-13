@@ -12,6 +12,7 @@ extern crate flipperzero_alloc;
 mod image;
 mod protocol_bwry;
 mod protocol_common;
+mod protocol_genb;
 mod tag_type;
 
 use core::ffi::c_void;
@@ -425,10 +426,9 @@ impl App {
                     let mut proto = protocol_bwry::BwryProtocol::new();
                     proto.write_image(image.as_slice())
                 }
-                (Protocol::IsodepGenb, AnyImage::Bwr(_image)) => {
-                    // GenB protocol not yet implemented
-                    self.show_message(c_str!("Error"), c_str!("GenB not implemented"));
-                    return;
+                (Protocol::IsodepGenb, AnyImage::Bwr(image)) => {
+                    let mut proto = protocol_genb::GenbProtocol::new();
+                    proto.write_image(image.as_slice())
                 }
                 _ => {
                     // This should never happen due to type safety
